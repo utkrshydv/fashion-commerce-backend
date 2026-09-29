@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse
 from app.core.config import get_settings
 from app.core.exceptions import AppException
 from app.core.logging import configure_logging, get_logger
+from app.core.scheduler import create_scheduler, register_jobs
 from app.db.client import connect_to_mongo, close_mongo_connection, get_database
 from app.db.indexes import ensure_indexes
 
@@ -67,12 +68,22 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     db = get_database()
     await ensure_indexes(db)
 
+    # Start background job scheduler.
+    scheduler = create_scheduler()
+    register_jobs(scheduler, db)
+    scheduler.start()
+    app.state.scheduler = scheduler
+    logger.info("Background scheduler started (%d jobs registered).", len(scheduler.get_jobs()))
+
     logger.info("Application startup complete — ready to serve requests.")
 
     yield  # ── Application is running ────────────────────────────────────────
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
     logger.info("Shutting down...")
+    if hasattr(app.state, "scheduler") and app.state.scheduler.running:
+        app.state.scheduler.shutdown(wait=False)
+        logger.info("Background scheduler stopped.")
     await close_mongo_connection()
     logger.info("Shutdown complete.")
 
