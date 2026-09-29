@@ -1,6 +1,5 @@
 # Fashion Commerce Platform Backend
 
-A production-style RESTful backend for a fashion e-commerce platform, built as a portfolio project demonstrating clean Python backend architecture.
 
 ## Tech Stack
 
