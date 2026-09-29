@@ -32,6 +32,7 @@ from app.schemas.product import (
     ProductUpdate,
 )
 from app.schemas.common import PaginatedResponse
+from app.schemas.search import SearchResult, SearchResponse
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -249,6 +250,60 @@ class ProductService:
         order history references. Hard delete is fine for this project.
         """
         return await self._repo.delete_one(product_id)
+
+    # ── Search ────────────────────────────────────────────────────────────────
+
+    async def search_products(
+        self,
+        query: str,
+        page: int = 1,
+        limit: int = 20,
+        category: Optional[str] = None,
+        status: Optional[str] = None,
+        min_price: Optional[float] = None,
+        max_price: Optional[float] = None,
+    ) -> SearchResponse:
+        """
+        Full-text search across product name, description, and brand.
+
+        Uses MongoDB $text search with relevance scoring.  Results are
+        returned in score-descending order (best match first) and support
+        additional AND filters (category, status, price range).
+
+        Minimum query length of 2 chars is enforced to prevent sending
+        an empty $text search to MongoDB (which raises an error).
+        """
+        extra_filters: Dict[str, Any] = {}
+        if category:
+            extra_filters["category"] = category
+        if status:
+            extra_filters["status"] = status
+        if min_price is not None or max_price is not None:
+            pf: Dict[str, float] = {}
+            if min_price is not None:
+                pf["$gte"] = min_price
+            if max_price is not None:
+                pf["$lte"] = max_price
+            extra_filters["final_price"] = pf
+
+        skip = (page - 1) * limit
+        docs, total = await self._repo.text_search(
+            query=query,
+            extra_filters=extra_filters,
+            skip=skip,
+            limit=limit,
+        )
+
+        items = [
+            SearchResult(
+                **ProductListItem.model_validate(d).model_dump(by_alias=True),
+                score=d.get("score"),
+            )
+            for d in docs
+        ]
+        return SearchResponse.build(
+            items=items, total=total, page=page, limit=limit, query=query
+        )
 
 
 def get_product_service(repo: ProductRepository) -> ProductService:

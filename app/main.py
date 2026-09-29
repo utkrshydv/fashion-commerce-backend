@@ -30,6 +30,7 @@ from app.db.indexes import ensure_indexes
 # ── Route imports ─────────────────────────────────────────────────────────────
 from app.api.routes import health
 from app.api.routes import products
+from app.api.routes import search
 
 logger = get_logger(__name__)
 
@@ -97,6 +98,7 @@ def create_app() -> FastAPI:
         openapi_tags=[
             {"name": "Health",    "description": "Service health and readiness checks."},
             {"name": "Products", "description": "Product catalog management."},
+            {"name": "Search",   "description": "Full-text product search."},
         ],
     )
 
@@ -159,9 +161,9 @@ def create_app() -> FastAPI:
     # ── Routers ───────────────────────────────────────────────────────────────
     app.include_router(health.router)
     app.include_router(products.router, prefix="/products", tags=["Products"])
+    app.include_router(search.router,   prefix="/search",   tags=["Search"])
 
     # Routers registered in later stages:
-    # app.include_router(search.router,   prefix="/search",   tags=["Search"])
     # app.include_router(cart.router,     prefix="/cart",     tags=["Cart"])
     # app.include_router(orders.router,   prefix="/orders",   tags=["Orders"])
     # app.include_router(inventory.router,prefix="/inventory",tags=["Inventory"])

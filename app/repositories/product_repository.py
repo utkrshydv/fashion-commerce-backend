@@ -212,6 +212,49 @@ class ProductRepository:
             logger.error("find_many failed: %s", exc)
             raise DatabaseException("Failed to list products.") from exc
 
+    async def text_search(
+        self,
+        query: str,
+        extra_filters: Dict[str, Any],
+        skip: int = 0,
+        limit: int = 20,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """
+        Full-text search using MongoDB's $text operator.
+
+        Uses the compound text index on (name, description, brand) with weights
+        name:10, brand:5, description:1 — products whose *name* matches rank higher
+        than those only matching in description.
+
+        The $meta 'textScore' projection adds a relevance score to each document.
+        We sort by that score descending (best match first).
+
+        extra_filters: additional AND conditions applied on top of the text filter.
+        """
+        text_filter: Dict[str, Any] = {"$text": {"$search": query}}
+        text_filter.update(extra_filters)
+
+        projection = {
+            "description": 0,
+            "image_urls": 0,
+            "score": {"$meta": "textScore"},
+        }
+
+        try:
+            total = await self._collection.count_documents(text_filter)
+            cursor = (
+                self._collection
+                .find(text_filter, projection=projection)
+                .sort([("score", {"$meta": "textScore"})])
+                .skip(skip)
+                .limit(limit)
+            )
+            docs = await cursor.to_list(length=limit)
+            return docs, total
+        except PyMongoError as exc:
+            logger.error("text_search failed for query=%r: %s", query, exc)
+            raise DatabaseException("Search failed.") from exc
+
 
 def get_product_repository(db: AsyncDatabase) -> ProductRepository:
     """
