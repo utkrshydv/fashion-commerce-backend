@@ -96,19 +96,6 @@ class ProductBase(BaseModel):
             raise ValueError("discount_percentage must be between 0 and 90")
         return v
 
-    @field_validator("available_sizes")
-    @classmethod
-    def sizes_must_not_be_empty_list(cls, v: Optional[List[str]]) -> Optional[List[str]]:
-        if v is not None and len(v) == 0:
-            raise ValueError("available_sizes cannot be an empty list")
-        return v
-
-    @field_validator("available_colors")
-    @classmethod
-    def colors_must_not_be_empty_list(cls, v: Optional[List[str]]) -> Optional[List[str]]:
-        if v is not None and len(v) == 0:
-            raise ValueError("available_colors cannot be an empty list")
-        return v
 
 
 # ── Create schema ─────────────────────────────────────────────────────────────
