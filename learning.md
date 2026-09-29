@@ -923,3 +923,366 @@ Gunicorn is a WSGI server (synchronous). FastAPI is async and uses the ASGI inte
 Stage 1 proved the architecture works. We found and fixed four real bugs — none of them would have been obvious without actually running the code and tests. The most important insight: **async Python has strict event loop ownership rules**. An `AsyncMongoClient` belongs to the loop that created it. Violating this rule causes runtime errors that are hard to diagnose if you don't understand the underlying mechanism. All of our test fixtures are now scoped correctly, and the reason is documented so you can explain it in an interview.
 
 ---
+
+---
+
+## Stage 2: Product Catalog CRUD
+
+### What Was Built
+
+A complete four-layer product catalog: schemas → repository → service → router.
+
+| Layer | File | Responsibility |
+|-------|------|----------------|
+| Schemas | `app/schemas/common.py` | PyObjectId, PaginationParams, PaginatedResponse[T] |
+| Schemas | `app/schemas/product.py` | ProductCreate, ProductUpdate, ProductResponse, ProductListItem |
+| Repository | `app/repositories/product_repository.py` | All MongoDB operations for the products collection |
+| Service | `app/services/product_service.py` | Business rules, final_price computation, filter/sort logic |
+| Router | `app/api/routes/products.py` | HTTP handler — parses request, calls service, returns response |
+| App | `app/main.py` | Registered `/products` router |
+
+**Endpoints added:**
+```
+POST   /products/            Create product
+GET    /products/            Paginated list with filters
+GET    /products/{id}        Get single product
+PUT    /products/{id}        Partial update
+DELETE /products/{id}        Delete product
+```
+
+**Tests:** 41 integration + 40 unit = **81 new tests** (total 139, all passing)
+
+---
+
+### The Four-Layer Architecture in Practice
+
+```
+HTTP Request
+    │
+    ▼
+Router (app/api/routes/products.py)
+    │  Parses HTTP request body, query params
+    │  Returns HTTP status codes
+    │  NO business logic
+    ▼
+Service (app/services/product_service.py)
+    │  Applies business rules (final_price, partial update logic)
+    │  Converts raw dicts to Pydantic response schemas
+    │  Orchestrates one or more repository calls
+    │  NO database driver code
+    ▼
+Repository (app/repositories/product_repository.py)
+    │  All MongoDB queries live here
+    │  Wraps driver exceptions in domain exceptions
+    │  Returns raw Python dicts (not Pydantic models)
+    │  NO business logic
+    ▼
+MongoDB
+    (products collection)
+```
+
+**Why this strict separation?**
+- You can swap MongoDB for PostgreSQL by rewriting only the repository.
+- You can add a Redis cache layer between the service and repository without touching the router.
+- Business rules (should this product be created?) are tested independently of HTTP (does the response have the right status code?).
+- The router is so thin that it rarely needs its own tests — the integration tests catch everything.
+
+---
+
+### How POST /products Works End-to-End
+
+**Request:**
+```http
+POST /products/
+Content-Type: application/json
+
+{
+  "sku": "SHIRT-001",
+  "name": "Classic White Shirt",
+  "brand": "Arrow",
+  "category": "Men",
+  "price": 999.0,
+  "discount_percentage": 10.0,
+  "stock_quantity": 50
+}
+```
+
+**Step by step:**
+
+1. **FastAPI receives the request** and matches it to `create_product(body, service)`.
+2. **Pydantic validates `body`** as `ProductCreate`:
+   - `sku` is stripped and uppercased by `@field_validator`.
+   - `price` is checked to be >= 0.
+   - `discount_percentage` is checked to be 0–90.
+   - If any field fails, FastAPI returns 422 before the function runs.
+3. **FastAPI resolves dependencies**: `get_database() → get_product_repository(db) → get_product_service(repo)`.
+4. **`router.create_product`** calls `service.create_product(body)`.
+5. **`service.create_product`**:
+   - Computes `final_price = 999 * (1 - 10/100) = 899.1`.
+   - Builds the MongoDB document dict (including `created_at`, `updated_at`).
+   - Calls `repo.insert_one(document)`.
+6. **`repo.insert_one`**:
+   - Calls `await collection.insert_one(document)`.
+   - If MongoDB raises `DuplicateKeyError` (SKU already exists), converts it to `DuplicateSKUException`.
+   - Returns the document with `_id` populated.
+7. **Service** calls `ProductResponse.model_validate(doc)` to convert the dict.
+8. **Router** returns the `ProductResponse` — FastAPI serializes it to JSON with `by_alias=True`.
+9. **HTTP 201 Created** with the product JSON.
+
+---
+
+### The `final_price` Business Rule
+
+**Why store `final_price` in MongoDB?**
+
+We could compute it on every read: `final_price = price * (1 - discount / 100)`. But:
+- List queries often filter by price (`min_price`, `max_price`). Filtering on a computed field requires a `$expr` query or an aggregation pipeline, both much slower than an indexed field equality check.
+- Sorting by `final_price` is not possible without either an index or an aggregation.
+
+By storing `final_price` alongside `price` and `discount_percentage`, we can:
+```
+db.products.find({ final_price: { $gte: 500 } }).sort({ final_price: 1 })
+```
+This query uses indexes efficiently.
+
+**The trade-off:** We must ensure `final_price` stays in sync. It is updated whenever `price` or `discount_percentage` changes:
+
+```python
+# In ProductService.update_product():
+if "price" in update_fields or "discount_percentage" in update_fields:
+    # Fetch the current value of whichever field wasn't in the update
+    current = await self._repo.find_by_id(product_id)
+    update_fields.setdefault("price", current["price"])
+    update_fields.setdefault("discount_percentage", current["discount_percentage"])
+    update_fields["final_price"] = self._compute_final_price(...)
+```
+
+This is a deliberate denormalization — trading storage space for query performance. The service layer is responsible for maintaining this invariant.
+
+---
+
+### How `model_dump(exclude_none=True)` Powers Partial Updates
+
+**The problem:** A PUT /products/{id} request that only changes the name shouldn't overwrite all other fields with None.
+
+**The solution:** `ProductUpdate` has all fields as `Optional[...]`. When the client sends:
+```json
+{"name": "New Name"}
+```
+
+Pydantic parses it as:
+```python
+ProductUpdate(name="New Name", price=None, brand=None, ...)
+```
+
+`data.model_dump(exclude_none=True)` returns only:
+```python
+{"name": "New Name"}
+```
+
+The repository then uses `$set`:
+```python
+await collection.find_one_and_update(
+    {"_id": oid},
+    {"$set": {"name": "New Name", "updated_at": now}},
+    return_document=True
+)
+```
+
+MongoDB's `$set` updates only the specified fields, leaving all others unchanged. This is true partial update semantics without needing the entire document to be resent.
+
+---
+
+### Why the Repository Wraps All PyMongo Exceptions
+
+```python
+try:
+    result = await self._collection.insert_one(document)
+except DuplicateKeyError:
+    raise DuplicateSKUException(...)
+except PyMongoError as exc:
+    raise DatabaseException("Failed to create product.") from exc
+```
+
+**Why not let PyMongo exceptions bubble up?**
+
+1. **Abstraction**: The service layer should not know or care about MongoDB-specific error types. If you switch to a different database driver, only the repository needs to change.
+2. **Consistent error format**: The global exception handler in `main.py` converts `AppException` subclasses to a standard JSON error format. PyMongo exceptions would leak as unhandled 500 errors with confusing messages.
+3. **Error messages**: `PyMongoError` messages are often driver-level jargon. `DatabaseException("Failed to create product.")` is a human-readable error.
+
+---
+
+### Why `find_one_and_update` Returns the Updated Document
+
+The repository uses:
+```python
+find_one_and_update(
+    {"_id": oid},
+    {"$set": fields},
+    return_document=True   # ← returns AFTER the update
+)
+```
+
+Without `return_document=True`, MongoDB returns the document state **before** the update. We want the updated state to return to the client, so we must use `return_document=True`.
+
+**The alternative:** Update, then find. But that's two round trips to MongoDB. `find_one_and_update` is a single atomic operation — the database engine applies the update and returns the result in one step. This eliminates the race condition where another request could modify the document between our update and our find.
+
+---
+
+### The PyObjectId Serialization Problem
+
+MongoDB stores `_id` as a `bson.ObjectId` type (a 12-byte binary identifier, displayed as a 24-character hex string). Python's JSON encoder doesn't know how to serialize `ObjectId`.
+
+**Our solution:** `PyObjectId(str)` — a subclass of `str` that validates the 24-char hex format.
+
+In the Pydantic model:
+```python
+class ProductResponse(BaseModel):
+    id: PyObjectId = Field(alias="_id")
+    # ↑ Python field name: "id"   ↑ MongoDB document key: "_id"
+```
+
+- Pydantic reads `doc["_id"]` (an `ObjectId`) via the alias.
+- `PyObjectId.validate()` converts it to a plain string.
+- When FastAPI serializes the response with `model_dump(by_alias=True)`, it uses `"_id"` as the JSON key.
+
+**Important realization from the bugs section:** FastAPI always serializes response models with `by_alias=True`. So the JSON response has `"_id"`, not `"id"`. Tests must look for `data["_id"]`.
+
+---
+
+### Pagination: Two Queries vs. $facet
+
+The list endpoint runs two MongoDB queries:
+```python
+total = await collection.count_documents(filters)     # query 1
+docs = await collection.find(filters).skip(n).limit(n)  # query 2
+```
+
+**Alternative:** MongoDB's `$facet` aggregation stage can return data and count in one pipeline:
+```javascript
+db.products.aggregate([
+    { $match: filters },
+    { $facet: {
+        data: [{ $skip: n }, { $limit: n }],
+        total: [{ $count: "count" }]
+    }}
+])
+```
+
+**Why we didn't use `$facet`:**
+- `count_documents()` on an indexed field (like `status`) is a fast O(1) index scan. It doesn't scan documents.
+- `$facet` always processes the entire matched result set before splitting — which is slower for large collections.
+- Two queries are easier to read and debug than a complex aggregation pipeline.
+- `$facet` shines when you need multiple computed metadata values (e.g., total + per-category counts + price histogram) in one query. For a simple count, the two-query approach wins.
+
+---
+
+### The Sort Field Whitelist
+
+```python
+_ALLOWED_SORT_FIELDS = {"price", "name", "created_at", "brand", "discount_percentage"}
+
+sort_field = sort_by if sort_by in _ALLOWED_SORT_FIELDS else _DEFAULT_SORT_FIELD
+```
+
+**Why not let the client sort by any field?**
+1. **Security**: Sorting by an un-indexed field forces MongoDB to load the entire collection into memory to sort it — a potential denial-of-service vector.
+2. **Predictability**: If a client sends `sort_by=__proto__` or some internal field, the query still works but the result is undefined and potentially leaks internal data shape.
+3. **All allowed fields have indexes** (defined in `indexes.py`), so sorts are O(log n) index scans.
+
+---
+
+### The `autouse=True` Fixture Pattern
+
+```python
+@pytest_asyncio.fixture(autouse=True)
+async def clean_products(db: AsyncDatabase) -> None:
+    await db["products"].delete_many({})   # setup: clean before test
+    yield
+    await db["products"].delete_many({})   # teardown: clean after test
+```
+
+**Why `autouse=True`?**
+Without it, every integration test that creates products needs to manually clean up:
+```python
+async def test_something(client, db):
+    ...
+    await db["products"].delete_many({})  # repeated in every test
+```
+
+With `autouse=True`, the fixture runs automatically for every test in the module. This guarantees:
+- Tests are independent regardless of execution order.
+- A test that crashes before its cleanup code still gets cleaned up by the `autouse` fixture's teardown block.
+- The test code itself is cleaner and focused on what it's testing.
+
+**The double cleanup pattern** (before AND after):
+- Before (`await db.delete_many({})` before `yield`): ensures a clean state even if a previous test left dirty data.
+- After (`await db.delete_many({})` after `yield`): cleans up after the test so other test modules aren't affected.
+
+---
+
+### Bugs Found and Fixed in Stage 2
+
+| Bug | Root Cause | Fix |
+|-----|-----------|-----|
+| `KeyError: 'id'` in tests | FastAPI serializes response with `by_alias=True`, so JSON key is `_id` not `id` | Changed test assertions from `data["id"]` to `data["_id"]` |
+| `duplicate_sku` on second test | Tests shared MongoDB state; no cleanup between tests | Added `autouse=True` cleanup fixture |
+| `NameError: pytest_asyncio not defined` | Missing import for module-level fixture | Added `import pytest_asyncio` |
+
+---
+
+### Interview Questions for Stage 2
+
+1. **What is the repository pattern and why use it?**
+   The repository pattern creates an abstraction layer between the application and the data source. All database queries for a given entity are in one class. Benefits: swap databases without changing business logic, test service layer by injecting a fake repository, all query logic in one place for easy review.
+
+2. **What does `$set` do in MongoDB?**
+   `$set` updates only the specified fields in a document, leaving all other fields unchanged. Without it, `update_one` would replace the entire document with the new document (a full replace), losing all fields not included in the update.
+
+3. **Why is `final_price` stored in MongoDB instead of computed on read?**
+   To enable efficient filtering and sorting. MongoDB can only filter and sort on stored fields using indexes. A computed field would require `$expr` queries or aggregation pipelines, which are much slower on large collections.
+
+4. **How does Pydantic's `Field(alias="_id")` work?**
+   The `alias` parameter tells Pydantic to read from a different key in the input data. `id: PyObjectId = Field(alias="_id")` means: when reading a MongoDB document, find the value at key `"_id"` and assign it to the Python attribute `id`. When serializing with `by_alias=True`, the JSON key will be `"_id"`.
+
+5. **What is `model_dump(exclude_none=True)` and when do you use it?**
+   `model_dump(exclude_none=True)` returns a dict of only the fields that are not `None`. Used for partial updates: clients send only the fields they want to change; `exclude_none=True` filters out the unset fields so the `$set` update only touches what was actually sent.
+
+6. **How does FastAPI's dependency injection chain work for the product router?**
+   ```
+   Depends(get_database)       → returns AsyncDatabase
+        ↓
+   Depends(get_product_repository(db)) → returns ProductRepository
+        ↓
+   Depends(get_product_service(repo))  → returns ProductService
+   ```
+   FastAPI resolves this chain automatically, calling each function and caching the result for the duration of the request. In tests, `get_database` is overridden via `dependency_overrides`, which causes all downstream dependencies to also receive the test database.
+
+7. **What is the difference between `return_document=True` and `return_document=False` in `find_one_and_update`?**
+   `return_document=False` (default) returns the document **before** the update was applied. `return_document=True` returns the document **after** the update. For a PUT endpoint that returns the updated resource, you must use `return_document=True`. Using the default would return stale data.
+
+8. **Why does the repository convert string IDs to `bson.ObjectId`?**
+   MongoDB stores `_id` as a `bson.ObjectId` type internally. If you query with a plain string like `{"_id": "abc123"}`, MongoDB will find nothing because the type doesn't match. The conversion `ObjectId(product_id_string)` ensures the query matches the actual stored type.
+
+9. **Why does an `autouse=True` fixture run twice (before and after yield)?**
+   An async pytest fixture with `yield` is a context manager. The code before `yield` is setup (runs before the test), the code after `yield` is teardown (runs after the test, even if the test fails). `autouse=True` makes it apply to every test in scope automatically.
+
+10. **What does `DuplicateKeyError` mean in MongoDB and how do we handle it?**
+    `DuplicateKeyError` is raised by the MongoDB driver when an `insert_one` or `update_one` operation would violate a unique index constraint (in our case, the `sku_unique` index). The repository catches it and raises `DuplicateSKUException`, which the global handler converts to HTTP 409 Conflict. This is preferable to checking "does this SKU exist?" before inserting, which would create a race condition.
+
+---
+
+### Things to Understand Before Stage 3
+
+- [ ] Why `final_price` is stored and not computed
+- [ ] How `$set` differs from a full document replace
+- [ ] Why the repository catches PyMongoError and re-raises as domain exceptions
+- [ ] How `model_dump(exclude_none=True)` enables partial updates
+- [ ] Why `find_one_and_update` with `return_document=True` is atomic
+- [ ] How `Field(alias="_id")` maps MongoDB documents to Pydantic models
+- [ ] Why `by_alias=True` in FastAPI serialization matters for test assertions
+- [ ] The autouse fixture pattern for test isolation
+- [ ] The sort field whitelist security rationale
+- [ ] Two-query pagination vs. `$facet` aggregation trade-offs
+
+---

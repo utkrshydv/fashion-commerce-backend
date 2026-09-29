@@ -118,7 +118,7 @@ scripts/
 |-------|-------------|--------|
 | 0 | Architecture & scaffolding | ✅ Complete |
 | 1 | FastAPI foundation + DB connection + health | ✅ Complete |
-| 2 | Product catalog CRUD | ⬜ Pending |
+| 2 | Product catalog CRUD | ✅ Complete |
 | 3 | Search + filtering + indexes | ⬜ Pending |
 | 4 | Inventory management | ⬜ Pending |
 | 5 | Shopping cart | ⬜ Pending |
