@@ -117,7 +117,7 @@ scripts/
 | Stage | Description | Status |
 |-------|-------------|--------|
 | 0 | Architecture & scaffolding | ✅ Complete |
-| 1 | FastAPI foundation + DB connection + health | ⬜ Pending |
+| 1 | FastAPI foundation + DB connection + health | ✅ Complete |
 | 2 | Product catalog CRUD | ⬜ Pending |
 | 3 | Search + filtering + indexes | ⬜ Pending |
 | 4 | Inventory management | ⬜ Pending |

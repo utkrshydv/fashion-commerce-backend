@@ -584,3 +584,342 @@ You won't be making architectural decisions while implementing features — thos
 already made.
 
 ---
+
+---
+
+## Stage 1: FastAPI Foundation + Configuration + MongoDB Connection + Lifecycle + Health Check
+
+### What We Built
+
+Stage 1 made the scaffold from Stage 0 actually run end-to-end. Everything before this stage existed as code but had never been executed as a real server.
+
+**Files created/modified:**
+
+| File | Change |
+|------|--------|
+| `.env` | New — local development environment variables |
+| `requirements.txt` | Fixed — removed deprecated `[srv]` extra from pymongo |
+| `app/db/client.py` | Hardened — added `serverSelectionTimeoutMS`, made `close()` properly awaited |
+| `app/main.py` | Improved — added `RuntimeError` handler, removed duplicate import, added `openapi_tags` |
+| `app/api/routes/health.py` | Fixed — `settings` now injected via `Depends(get_settings)` instead of direct call |
+| `tests/conftest.py` | New — full test fixture infrastructure |
+| `tests/integration/test_health.py` | New — 7 integration tests for GET /health |
+| `tests/unit/test_config.py` | New — 11 unit tests for Settings |
+| `tests/unit/test_exceptions.py` | New — 37 unit tests for exception hierarchy |
+
+**Test result: 55 passed, 0 failed, 0 warnings.**
+
+---
+
+### Why We Built It This Way
+
+Stage 0 was architecture. Stage 1 is the proof that it works. Before writing any business logic (products, orders, etc.), we need to be absolutely certain that:
+- The server starts cleanly
+- MongoDB connects and indexes are created
+- The health endpoint responds correctly
+- Tests can run against the real codebase without touching the dev database
+
+Everything built in Stage 1 is infrastructure that every future stage depends on.
+
+---
+
+### How It Works: Full Startup Sequence
+
+When you run `uvicorn app.main:app`:
+
+```
+1. Python imports app.main
+2. create_app() builds the FastAPI instance
+3. Middleware (CORS) is registered
+4. Exception handlers are registered (AppException, RuntimeError)
+5. health.router is included
+6. Module-level `app = create_app()` is assigned
+7. Uvicorn calls the lifespan(app) async generator
+8. configure_logging() sets up the log formatter
+9. get_settings() reads .env → returns Settings(app_env="development", ...)
+10. connect_to_mongo() creates AsyncMongoClient(uri, serverSelectionTimeoutMS=5000)
+11. client.admin.command("ping") verifies MongoDB is reachable (fails fast in 5s if not)
+12. get_database() returns the handle
+13. ensure_indexes(db) runs create_index() on all 4 collections (idempotent)
+14. yield — server is live, accepting requests
+15. On Ctrl+C/SIGTERM: close_mongo_connection() → await _client.close()
+```
+
+The actual log output from our run:
+```
+INFO | app.main      | Starting Fashion Commerce Backend v0.1.0 [env=development]
+INFO | app.db.client | Connecting to MongoDB at mongodb://localhost:27017
+INFO | app.db.client | MongoDB connected — database: fashion_commerce (timeout: 5000ms)
+INFO | app.db.indexes| Product indexes ensured.
+INFO | app.db.indexes| Order indexes ensured.
+INFO | app.db.indexes| Cart indexes ensured.
+INFO | app.db.indexes| Inventory indexes ensured.
+INFO | app.db.indexes| All MongoDB indexes ensured.
+INFO | app.main      | Application startup complete — ready to serve requests.
+```
+
+---
+
+### How a Request Flows Through GET /health
+
+```
+httpx/browser: GET http://localhost:8000/health
+    │
+    ▼
+Uvicorn (ASGI server)
+    │ parses HTTP, calls the ASGI app
+    ▼
+FastAPI routing
+    │ matches "/health" → health_check()
+    ▼
+FastAPI dependency resolution
+    │ Depends(get_database) → calls get_database() → returns _database handle
+    │ Depends(get_settings) → calls get_settings() → returns cached Settings
+    ▼
+health_check(db=<AsyncDatabase>, settings=<Settings>)
+    │ await db.command("ping") → MongoDB responds { ok: 1 }
+    │ db_status = "ok"
+    │ returns {"status": "ok", "version": "0.1.0", "environment": "development", "database": "ok"}
+    ▼
+FastAPI serializes dict → JSON response body
+    ▼
+HTTP 200 {"status": "ok", "version": "0.1.0", ...}
+```
+
+---
+
+### The `serverSelectionTimeoutMS` Fix
+
+**Before Stage 1:** If MongoDB was down when the server started, PyMongo would wait 30 seconds before raising an error. The server appeared to hang with no log output.
+
+**After Stage 1:** We pass `serverSelectionTimeoutMS=5_000` to `AsyncMongoClient`. If MongoDB is unreachable, the startup `ping` command fails in ≤5 seconds with a clear error message. Uvicorn logs it and exits instead of silently hanging.
+
+This is the difference between:
+```
+# Bad: no output for 30 seconds, then cryptic crash
+uvicorn app.main:app
+[30 seconds of silence...]
+ERROR: Application startup failed.
+```
+
+and:
+```
+# Good: immediate, clear failure
+INFO | Connecting to MongoDB at mongodb://localhost:27017
+ERROR | ServerSelectionTimeoutError after 5s — check MONGODB_URI
+```
+
+---
+
+### Why Settings Must Be a FastAPI Dependency
+
+**The bug we found and fixed:**
+
+The original `health_check()` called `get_settings()` directly:
+```python
+# BEFORE (broken for tests)
+async def health_check(db = Depends(get_database)):
+    settings = get_settings()          # called directly
+    return {"environment": settings.app_env, ...}
+```
+
+In tests, we set `app.dependency_overrides[get_settings] = lambda: test_settings`.
+FastAPI's `dependency_overrides` only intercepts calls that go through its `Depends()` system.
+A direct `get_settings()` call bypasses it entirely.
+
+So the test saw `environment="development"` instead of `"testing"` — the override had no effect.
+
+**The fix:**
+```python
+# AFTER (correct)
+async def health_check(
+    db: AsyncDatabase = Depends(get_database),
+    settings: Settings = Depends(get_settings),  # injected, not called directly
+):
+    return {"environment": settings.app_env, ...}
+```
+
+**Rule to remember:** Any value that a test might need to override must be received through `Depends()`, not fetched directly inside the function. This applies to settings, database handles, authentication tokens, external service clients — anything that varies between environments.
+
+---
+
+### The Event Loop Problem in Tests (and How We Solved It)
+
+**The bug we found:**
+
+Our first version of `conftest.py` created the `AsyncMongoClient` at session scope:
+```python
+@pytest_asyncio.fixture(scope="session")
+async def mongo_client(test_settings):
+    mc = AsyncMongoClient(...)  # created in the session event loop
+    yield mc
+```
+
+pytest-asyncio (with `asyncio_mode="auto"`) creates a **new event loop for each test function**. PyMongo's `AsyncMongoClient` binds internally to the event loop it was created on. When a test function's loop tried to use a client created in the session's loop, it raised:
+
+```
+RuntimeWarning: Cannot use AsyncMongoClient in different event loop.
+AsyncMongoClient uses low-level asyncio APIs that bind it to the event loop it was created on.
+```
+
+**The fix:** Make the `db` fixture function-scoped. Each test function creates its own `AsyncMongoClient` in its own event loop, uses it, then closes it.
+
+```python
+@pytest_asyncio.fixture(scope="function")   # ← function scope, not session
+async def db(test_settings: Settings) -> AsyncDatabase:
+    mc = AsyncMongoClient(...)    # same event loop as the test
+    ...
+    yield database
+    await mc.close()              # same event loop closes it
+```
+
+Performance impact: each test now does one MongoDB connection + ping (~1ms). For 55 tests, this adds about 50ms total. Completely acceptable.
+
+**Rule to remember:** In async Python, objects that hold internal references to an event loop must be created and destroyed in the same loop. When in doubt, use function scope for async resources in pytest.
+
+---
+
+### Why `mc.close()` Must Be Awaited
+
+During the first run, we got:
+```
+RuntimeWarning: coroutine 'AsyncMongoClient.close' was never awaited
+```
+
+In PyMongo 4.18, `AsyncMongoClient` is fully async, including its `close()` method. Calling it without `await` creates a coroutine object but never executes it — the connection is never actually closed.
+
+```python
+mc.close()        # WRONG: schedules close but doesn't run it
+await mc.close()  # CORRECT: actually closes the connection
+```
+
+We fixed this in both `tests/conftest.py` (test fixture) and `app/db/client.py` (production shutdown handler).
+
+---
+
+### How the Test Infrastructure Works
+
+**conftest.py creates three fixtures:**
+
+1. **`test_settings`** (session scope):
+   - Constructs `Settings(app_env="testing", mongodb_database="fashion_commerce_test", ...)`
+   - Created once for the entire test session
+   - No event loop dependency — just a Python object
+
+2. **`db`** (function scope):
+   - Creates a fresh `AsyncMongoClient` per test (same event loop)
+   - Runs `ensure_indexes()` so all tests start with indexes in place
+   - `yield`s the `AsyncDatabase` handle
+   - Awaits `mc.close()` after the test
+   - Use this to seed data or inspect the DB directly
+
+3. **`client`** (function scope):
+   - Calls `create_app()` fresh for each test
+   - Overrides `get_database → lambda: db` (injects the test DB)
+   - Overrides `get_settings → lambda: test_settings` (injects test config)
+   - Wraps in `httpx.AsyncClient(transport=ASGITransport(app))` — no real TCP port
+   - Use this to make HTTP requests in integration tests
+
+**What `ASGITransport` does:**
+
+Instead of binding a real port and sending HTTP bytes over TCP, `ASGITransport` feeds requests directly into the FastAPI ASGI callable. The full middleware, routing, exception handling, and dependency injection stack runs — just without the network layer. Tests are faster and don't need `httpx` to find an open port.
+
+---
+
+### What `dependency_overrides` Does
+
+FastAPI maintains a dict on the app object:
+```python
+app.dependency_overrides: dict[Callable, Callable]
+```
+
+When FastAPI resolves a dependency like `Depends(get_database)`, it checks `dependency_overrides` first:
+- If `get_database` is a key in `dependency_overrides`, it calls the override instead.
+- Otherwise, it calls the real `get_database`.
+
+In tests:
+```python
+app.dependency_overrides[get_database] = lambda: db     # lambda returns the test DB
+app.dependency_overrides[get_settings] = lambda: test_settings  # lambda returns test config
+```
+
+Every route that uses `Depends(get_database)` or `Depends(get_settings)` now gets the test values. The real `get_database()` function (which checks `_database is None`) is never called — so we don't need the lifespan to have run.
+
+This is why the rule "use Depends() for anything that varies between environments" is so important: only things that go through Depends() can be overridden.
+
+---
+
+### Bug Inventory for Stage 1
+
+| Bug | Root cause | Fix |
+|-----|-----------|-----|
+| Server hangs 30s on bad Mongo URI | Default `serverSelectionTimeoutMS=30000` | Set to `5000` in `AsyncMongoClient(...)` |
+| Test `environment` was `"development"` not `"testing"` | `get_settings()` called directly, bypassing `dependency_overrides` | Pass `settings` via `Depends(get_settings)` |
+| `RuntimeWarning: cannot use AsyncMongoClient in different event loop` | Session-scoped client shared across per-function event loops | Made `db` fixture function-scoped |
+| `RuntimeWarning: coroutine ... was never awaited` | `mc.close()` called without `await` (pymongo 4.18 close is async) | `await mc.close()` in conftest and client.py |
+
+---
+
+### Important Concepts from Stage 1
+
+**ASGI (Asynchronous Server Gateway Interface):**
+ASGI is the protocol that connects Python web frameworks (FastAPI, Django async, Starlette) to async-capable web servers (Uvicorn, Hypercorn). It defines how the server calls the framework and how the framework returns responses. Uvicorn is the ASGI *server*; FastAPI is the ASGI *application*. `ASGITransport` in httpx lets tests call the ASGI application directly, without a server.
+
+**Why Uvicorn and not Gunicorn alone?**
+Gunicorn is a WSGI server (synchronous). FastAPI is async and uses the ASGI interface. Uvicorn is the standard ASGI server for FastAPI. In production, you often see `gunicorn -k uvicorn.workers.UvicornWorker` — Gunicorn manages multiple Uvicorn worker processes for multi-core CPU utilization, while each worker runs the async event loop.
+
+**What is `asynccontextmanager`?**
+`@asynccontextmanager` turns an async generator function into a context manager. The `yield` is the boundary: code before it runs on `__aenter__` (startup), code after it runs on `__aexit__` (shutdown). FastAPI calls the lifespan generator with `async with` internally — everything before `yield` runs at startup, everything after at shutdown.
+
+**Why does `lru_cache` matter for `get_settings()`?**
+`Settings()` reads and parses the `.env` file and all environment variables every time it's called. With `@lru_cache(maxsize=1)`, parsing happens exactly once per process. Every subsequent call to `get_settings()` returns the cached object in nanoseconds. Without it, reading a `.env` file for every incoming request would add measurable latency under load.
+
+---
+
+### Interview Questions for Stage 1
+
+1. **What is ASGI and how is it different from WSGI?**
+   WSGI is synchronous — one request blocks the worker thread until the response is returned. ASGI is async — one worker can handle thousands of concurrent requests by yielding control to the event loop while waiting for I/O (database, network). FastAPI requires ASGI; Flask uses WSGI by default.
+
+2. **What does `serverSelectionTimeoutMS` control in PyMongo?**
+   When PyMongo needs to run a command, it tries to select a suitable MongoDB server from the topology. If no server is available (wrong URI, server down), `serverSelectionTimeoutMS` controls how long it waits before raising `ServerSelectionTimeoutError`. Default is 30 seconds. We set it to 5 to fail fast.
+
+3. **What is dependency injection in FastAPI?**
+   Instead of functions fetching their own dependencies (calling `get_settings()` or creating their own database connections), FastAPI creates and injects the dependencies. `Depends(get_database)` tells FastAPI: "call `get_database()` and pass the result as this argument." Tests can substitute fake implementations via `dependency_overrides`.
+
+4. **Why are your test fixtures function-scoped and not session-scoped?**
+   Because pytest-asyncio creates a new event loop per test function, and `AsyncMongoClient` binds to the loop it was created in. A session-scoped client would be created in the session's loop but used from per-function loops — causing a runtime error. Function-scoped fixtures create and close the client within the same event loop.
+
+5. **What does `ASGITransport` do in httpx?**
+   It lets httpx send requests directly into an ASGI application callable, bypassing the network entirely. The full FastAPI middleware, routing, dependency injection, and exception handling runs, but no TCP port is opened. Tests are faster, more reliable (no port conflicts), and don't require the server to be running separately.
+
+6. **What happens if `connect_to_mongo()` fails during startup?**
+   The exception propagates out of the lifespan generator's startup block. FastAPI/Uvicorn catches it, logs the error, and exits the process. The server never starts serving traffic. This is correct: a server that can't reach its database should not pretend to be healthy.
+
+7. **How does the global exception handler in `main.py` work?**
+   `@app.exception_handler(AppException)` registers a handler for any exception that is a subclass of `AppException`. FastAPI catches the exception before returning a 500, calls the handler, and returns the handler's `JSONResponse` instead. Services never need to know about HTTP status codes — they raise typed domain exceptions, and the handler converts them in one place.
+
+8. **Why does every route use `Depends(get_settings)` instead of calling `get_settings()` directly?**
+   `dependency_overrides` only intercepts calls that go through the FastAPI dependency system. A direct call bypasses the override and always returns the production settings — even in tests. To make a function's dependencies replaceable in tests, they must come through `Depends()`.
+
+---
+
+### Things I Should Be Able to Explain Before Stage 2
+
+- [ ] How the FastAPI lifespan context manager works (startup → yield → shutdown)
+- [ ] What ASGI is and why Uvicorn is needed
+- [ ] How `dependency_overrides` makes tests possible without mocking
+- [ ] Why `serverSelectionTimeoutMS` matters and what happens without it
+- [ ] Why `AsyncMongoClient.close()` must be awaited in pymongo 4.18
+- [ ] Why the event loop scope of async fixtures must match the test function scope
+- [ ] The difference between `@lru_cache` on `get_settings()` and calling `Settings()` each time
+- [ ] How `ASGITransport` differs from making HTTP requests to a running server
+- [ ] Why services should raise `AppException` subclasses instead of `HTTPException`
+
+---
+
+### Key Takeaway for Stage 1
+
+Stage 1 proved the architecture works. We found and fixed four real bugs — none of them would have been obvious without actually running the code and tests. The most important insight: **async Python has strict event loop ownership rules**. An `AsyncMongoClient` belongs to the loop that created it. Violating this rule causes runtime errors that are hard to diagnose if you don't understand the underlying mechanism. All of our test fixtures are now scoped correctly, and the reason is documented so you can explain it in an interview.
+
+---

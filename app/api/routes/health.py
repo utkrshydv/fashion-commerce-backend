@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends
 from pymongo.asynchronous.database import AsyncDatabase
 
 from app.db.client import get_database
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -35,16 +35,20 @@ router = APIRouter()
     tags=["Health"],
     response_model=dict,
 )
-async def health_check(db: AsyncDatabase = Depends(get_database)) -> dict:
+async def health_check(
+    db: AsyncDatabase = Depends(get_database),
+    settings: Settings = Depends(get_settings),
+) -> dict:
     """
     Lightweight health check.
 
     Performs a MongoDB 'ping' command to verify the database is reachable.
     Returns 200 if both API and DB are healthy; reports DB status separately
     so that an upstream monitor can distinguish between the two failure modes.
-    """
-    settings = get_settings()
 
+    Both `db` and `settings` are injected via FastAPI Depends() so that
+    integration tests can override them through app.dependency_overrides.
+    """
     db_status = "unreachable"
     try:
         await db.command("ping")
