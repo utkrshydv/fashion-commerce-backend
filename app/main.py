@@ -33,6 +33,7 @@ from app.api.routes import products
 from app.api.routes import search
 from app.api.routes import inventory
 from app.api.routes import cart
+from app.api.routes import orders
 
 logger = get_logger(__name__)
 
@@ -103,6 +104,7 @@ def create_app() -> FastAPI:
             {"name": "Search",    "description": "Full-text product search."},
             {"name": "Inventory", "description": "Stock level management."},
             {"name": "Cart",      "description": "Shopping cart operations."},
+            {"name": "Orders",    "description": "Order placement and management."},
         ],
     )
 
@@ -168,9 +170,7 @@ def create_app() -> FastAPI:
     app.include_router(search.router,     prefix="/search",     tags=["Search"])
     app.include_router(inventory.router,  prefix="/inventory",  tags=["Inventory"])
     app.include_router(cart.router,       prefix="/cart",       tags=["Cart"])
-
-    # Routers registered in later stages:
-    # app.include_router(orders.router, prefix="/orders", tags=["Orders"])
+    app.include_router(orders.router,     prefix="/orders",     tags=["Orders"])
 
     return app
 
