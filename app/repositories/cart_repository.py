@@ -187,12 +187,19 @@ class CartRepository:
             raise DatabaseException("Failed to remove item from cart.") from exc
 
     async def clear_cart(self, user_id: str) -> Dict[str, Any]:
-        """Remove all items from the cart (used after order placement)."""
+        """
+        Remove all items from the cart (used after order placement or by user request).
+
+        Uses upsert=True so that calling clear on a non-existent cart creates an
+        empty one rather than returning None (idempotent behaviour).
+        """
         try:
             now = self._utcnow()
             doc = await self._col.find_one_and_update(
                 {"user_id": user_id},
-                {"$set": {"items": [], "total": 0.0, "item_count": 0, "updated_at": now}},
+                {"$set": {"items": [], "total": 0.0, "item_count": 0, "updated_at": now},
+                 "$setOnInsert": {"user_id": user_id, "created_at": now}},
+                upsert=True,
                 return_document=True,
             )
             return self._str_id(doc)
