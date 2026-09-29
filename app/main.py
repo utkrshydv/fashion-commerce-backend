@@ -29,6 +29,7 @@ from app.db.indexes import ensure_indexes
 
 # ── Route imports ─────────────────────────────────────────────────────────────
 from app.api.routes import health
+from app.api.routes import products
 
 logger = get_logger(__name__)
 
@@ -94,7 +95,8 @@ def create_app() -> FastAPI:
         docs_url="/docs",
         redoc_url="/redoc",
         openapi_tags=[
-            {"name": "Health", "description": "Service health and readiness checks."},
+            {"name": "Health",    "description": "Service health and readiness checks."},
+            {"name": "Products", "description": "Product catalog management."},
         ],
     )
 
@@ -156,9 +158,9 @@ def create_app() -> FastAPI:
 
     # ── Routers ───────────────────────────────────────────────────────────────
     app.include_router(health.router)
+    app.include_router(products.router, prefix="/products", tags=["Products"])
 
     # Routers registered in later stages:
-    # app.include_router(products.router, prefix="/products", tags=["Products"])
     # app.include_router(search.router,   prefix="/search",   tags=["Search"])
     # app.include_router(cart.router,     prefix="/cart",     tags=["Cart"])
     # app.include_router(orders.router,   prefix="/orders",   tags=["Orders"])
