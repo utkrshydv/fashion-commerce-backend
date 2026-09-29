@@ -1,4 +1,4 @@
-# Fashion Commerce Platform Backend
+﻿# Fashion Commerce Platform Backend
 
 A production-style RESTful backend for a fashion e-commerce platform, built as a portfolio project demonstrating clean Python backend architecture.
 
@@ -19,10 +19,10 @@ A production-style RESTful backend for a fashion e-commerce platform, built as a
 
 ```
 Request
-  └─► Router (app/api/routes/)       ← thin HTTP layer, no business logic
-        └─► Service (app/services/)  ← business logic, orchestration
-              └─► Repository (app/repositories/)  ← database queries only
-                    └─► MongoDB
+  â””â”€â–º Router (app/api/routes/)       â† thin HTTP layer, no business logic
+        â””â”€â–º Service (app/services/)  â† business logic, orchestration
+              â””â”€â–º Repository (app/repositories/)  â† database queries only
+                    â””â”€â–º MongoDB
 ```
 
 Configuration, exceptions, logging, and database lifecycle live in `app/core/` and `app/db/`.
@@ -42,7 +42,7 @@ pip install -r requirements.txt
 
 # 3. Configure environment
 cp .env.example .env
-# Edit .env — set MONGODB_URI if MongoDB is not running locally
+# Edit .env â€” set MONGODB_URI if MongoDB is not running locally
 
 # 4. Run the API
 uvicorn app.main:app --reload
@@ -94,39 +94,39 @@ pytest
 
 ```
 app/
-├── main.py                     # App factory + lifespan handler
-├── api/routes/                 # HTTP route handlers (thin)
-├── core/                       # Config, exceptions, logging
-├── db/                         # MongoDB client + indexes
-├── models/                     # Document shapes (DB layer)
-├── schemas/                    # Request/Response schemas (API layer)
-├── repositories/               # MongoDB queries
-├── services/                   # Business logic
-└── utils/
+â”œâ”€â”€ main.py                     # App factory + lifespan handler
+â”œâ”€â”€ api/routes/                 # HTTP route handlers (thin)
+â”œâ”€â”€ core/                       # Config, exceptions, logging
+â”œâ”€â”€ db/                         # MongoDB client + indexes
+â”œâ”€â”€ models/                     # Document shapes (DB layer)
+â”œâ”€â”€ schemas/                    # Request/Response schemas (API layer)
+â”œâ”€â”€ repositories/               # MongoDB queries
+â”œâ”€â”€ services/                   # Business logic
+â””â”€â”€ utils/
 
 tests/
-├── unit/                       # Service/logic unit tests
-└── integration/                # Full request-to-DB tests
+â”œâ”€â”€ unit/                       # Service/logic unit tests
+â””â”€â”€ integration/                # Full request-to-DB tests
 
 scripts/
-└── seed_database.py            # Development seed data
+â””â”€â”€ seed_database.py            # Development seed data
 ```
 
 ## Build Stages
 
 | Stage | Description | Status |
 |-------|-------------|--------|
-| 0 | Architecture & scaffolding | ✅ Complete |
-| 1 | FastAPI foundation + DB connection + health | ✅ Complete |
-| 2 | Product catalog CRUD | ✅ Complete |
-| 3 | Search + filtering + indexes | ⬜ Pending |
-| 4 | Inventory management | ⬜ Pending |
-| 5 | Shopping cart | ⬜ Pending |
-| 6 | Orders | ⬜ Pending |
-| 7 | Background processing | ⬜ Pending |
-| 8 | Testing | ⬜ Pending |
-| 9 | Docker + seed data | ⬜ Pending |
-| 10 | End-to-end verification | ⬜ Pending |
+| 0 | Architecture & scaffolding | âœ… Complete |
+| 1 | FastAPI foundation + DB connection + health | âœ… Complete |
+| 2 | Product catalog CRUD | âœ… Complete |
+| 3 | Search + filtering + indexes | â¬œ Pending |
+| 4 | Inventory management | â¬œ Pending |
+| 5 | Shopping cart | â¬œ Pending |
+| 6 | Orders | â¬œ Pending |
+| 7 | Background processing | â¬œ Pending |
+| 8 | Testing | â¬œ Pending |
+| 9 | Docker + seed data | â¬œ Pending |
+| 10 | End-to-end verification | â¬œ Pending |
 
 ## Learning Document
 

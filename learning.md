@@ -1286,3 +1286,382 @@ With `autouse=True`, the fixture runs automatically for every test in the module
 - [ ] Two-query pagination vs. `$facet` aggregation trade-offs
 
 ---
+
+---
+
+## Stage 3: Search — MongoDB Full-Text Index
+
+### What Was Built
+
+| File | Purpose |
+|------|---------|
+| `app/schemas/search.py` | `SearchResult` (adds `score` field to `ProductListItem`), `SearchResponse` |
+| `app/repositories/product_repository.py` | Added `text_search()` method |
+| `app/services/product_service.py` | Added `search_products()` method |
+| `app/api/routes/search.py` | `GET /search?q=...` |
+
+**Endpoint:** `GET /search?q=<query>&category=&min_price=&max_price=&page=&limit=`
+
+### How MongoDB Text Search Works
+
+A text index was created in Stage 0 (`indexes.py`):
+```python
+await products.create_index(
+    [("name", TEXT), ("description", TEXT), ("brand", TEXT)],
+    name="text_search",
+    weights={"name": 10, "brand": 5, "description": 1},
+)
+```
+
+**Weights** mean a product whose *name* contains the query word scores 10x higher than one where it only appears in the description. This is how search relevance tuning works in MongoDB.
+
+**The `$text` query:**
+```python
+text_filter = {"$text": {"$search": query}}
+```
+
+MongoDB matches documents where any of the indexed fields contain the query terms (case-insensitive, handles stemming).
+
+**The `$meta` textScore projection:**
+```python
+projection = {
+    "score": {"$meta": "textScore"},
+}
+cursor.sort([("score", {"$meta": "textScore"})])
+```
+
+`$meta "textScore"` injects the computed relevance score into each result document and allows sorting by it. Higher score = better match.
+
+### Why Search is a Separate Endpoint from /products
+
+| Concern | `/products` (list) | `/search` |
+|---------|--------------------|-----------|
+| Use case | Browse catalog | Find specific items |
+| Sort | Configurable (price, name, date) | Fixed: relevance score |
+| Response | `ProductListItem` | `SearchResult` (+ score) |
+| Query param | No text query | `q` required, min 2 chars |
+| Filters | All | Category + price only |
+
+Mixing them into one endpoint would produce a messy API with optional parameters that interact confusingly.
+
+### Interview Questions — Stage 3
+
+1. **What is a MongoDB text index?** A special index type that tokenizes and indexes string fields for full-text search. Supports case-insensitive matching, stop-word removal, and relevance scoring.
+
+2. **What are index weights in MongoDB text search?** Weights control the relative relevance contribution of each indexed field. A match in a field with weight 10 scores 10x higher than a match in a field with weight 1, allowing name matches to rank higher than description matches.
+
+3. **What does `{"$meta": "textScore"}` do?** In a projection, it adds a `score` field to each result document containing the computed text relevance score. In a sort, it orders results by that score (descending = best match first).
+
+4. **What is the minimum query length and why?** 2 characters, enforced by `Query(min_length=2)` in FastAPI. An empty `$text` query raises a MongoDB error; very short queries (1 char) are stop words in most languages and return no useful results.
+
+5. **What are the limitations of MongoDB text search vs. Elasticsearch?** MongoDB text search lacks: phrase matching, fuzzy matching (typos), field boosting at query time, synonyms, faceted counts, and advanced tokenization. Elasticsearch (or Atlas Search) is preferred for production-grade search.
+
+---
+
+## Stage 4: Inventory Management
+
+### What Was Built
+
+| File | Purpose |
+|------|---------|
+| `app/schemas/inventory.py` | `InventoryResponse`, `InventoryUpdate` (delta), `LowStockItem` |
+| `app/repositories/inventory_repository.py` | `get_or_create`, `adjust_stock` (atomic `$inc`), `find_low_stock` |
+| `app/services/inventory_service.py` | Validates product exists, delegates to repo |
+| `app/api/routes/inventory.py` | 3 endpoints |
+
+**Endpoints:**
+```
+GET  /inventory/{product_id}          → stock level (creates with qty=0 if new)
+POST /inventory/{product_id}/adjust   → adjust stock (+ or -)
+GET  /inventory/low-stock?threshold=  → items below threshold
+```
+
+### The Atomic `$inc` Stock Deduction Pattern
+
+This is the most important concept in inventory management:
+
+**BAD — read-modify-write (race condition):**
+```python
+inv = await collection.find_one({"product_id": id})
+new_qty = inv["quantity"] - requested
+await collection.update_one({"product_id": id}, {"$set": {"quantity": new_qty}})
+```
+If two requests run simultaneously, both read `quantity=10`, both compute `new_qty=8`, and both write `8` — you've lost one deduction.
+
+**GOOD — atomic `$inc` with guard filter:**
+```python
+updated = await collection.find_one_and_update(
+    {"product_id": id, "quantity": {"$gte": requested}},  # guard
+    {"$inc": {"quantity": -requested}},                   # atomic
+    return_document=True,
+)
+if updated is None:
+    raise InsufficientStockException(...)
+```
+MongoDB processes this as a single atomic operation at the server. The filter `quantity >= requested` ensures the deduction only happens if sufficient stock exists. If two requests race: one will succeed and one will find `quantity < requested` and fail cleanly.
+
+### Lazy Inventory Initialization (`get_or_create`)
+
+```python
+await collection.find_one_and_update(
+    {"product_id": product_id},
+    {"$setOnInsert": {"quantity": 0, ...}},
+    upsert=True,
+    return_document=True,
+)
+```
+
+`$setOnInsert` only applies fields if this is a new insert (not a find). This creates the inventory record atomically the first time it's accessed — no separate "create inventory" step needed when creating a product.
+
+### Why Inventory is Separate from Products
+
+- **Independent scale**: inventory changes constantly (every sale, every restock). Product catalog changes rarely.
+- **Locking**: high-frequency inventory writes on the same document would create lock contention if inventory were embedded in the product document.
+- **Separation of concerns**: catalog manages product metadata; inventory manages stock levels.
+- **Future**: could be sharded by warehouse, or replaced with a dedicated stock management service.
+
+### Interview Questions — Stage 4
+
+1. **Why use `$inc` instead of `$set` for stock updates?** `$inc` is atomic — MongoDB applies the increment as a single operation without reading the current value. `$set` requires a read-modify-write cycle that creates a race condition under concurrent requests.
+
+2. **What is `$setOnInsert`?** An update operator that only applies its fields when the operation results in an insert (upsert=True creates a new document). Used for lazy initialization: create a default record only if none exists.
+
+3. **How do you prevent stock from going negative?** Add a filter condition `{"quantity": {"$gte": abs(delta)}}` to the update. If the condition doesn't match, `find_one_and_update` returns `None` without modifying the document, which we interpret as insufficient stock.
+
+4. **What is the difference between `upsert=True` and a separate insert?** Upsert is atomic — find-or-insert happens in one server operation. Separate insert-if-not-found creates a race where two concurrent requests could both find "not found" and both try to insert, causing a duplicate key error. Upsert handles this automatically.
+
+---
+
+## Stage 5: Shopping Cart
+
+### What Was Built
+
+| File | Purpose |
+|------|---------|
+| `app/schemas/cart.py` | `CartItem`, `CartItemAdd`, `CartItemUpdate`, `CartResponse` |
+| `app/repositories/cart_repository.py` | CRUD for cart items + total recomputation |
+| `app/services/cart_service.py` | Product validation, price snapshot |
+| `app/api/routes/cart.py` | 5 endpoints using `X-User-ID` header |
+
+**Endpoints:**
+```
+GET    /cart                         → get/create cart
+POST   /cart/items                   → add item (or replace)
+PUT    /cart/items/{product_id}      → update quantity
+DELETE /cart/items/{product_id}      → remove item
+DELETE /cart                         → clear cart
+```
+
+### Price Snapshot — The Most Important Cart Design Decision
+
+When a user adds a product to the cart, we record the price *at that moment*:
+```python
+unit_price = product.get("final_price", product["price"])
+item_doc = {
+    "unit_price": unit_price,
+    "subtotal": round(unit_price * data.quantity, 2),
+    ...
+}
+```
+
+If the product price changes after the item is added, the cart still shows the original price. This is **intentional and standard** e-commerce behaviour:
+- The user saw a price and decided to buy at that price.
+- Changing the cart price without warning would be a UX betrayal.
+- Most retailers honor the cart price for a session window (e.g. 24 hours).
+
+The snapshot is a **denormalization** — we store data that's also in the products collection. This is a deliberate trade-off: data duplication in exchange for price stability.
+
+### The `$pull` + `$push` Item Upsert Pattern
+
+MongoDB doesn't have a native "upsert array element" operation. To replace an existing item with a new one (e.g. update quantity), we:
+```python
+# 1. Remove existing item (if any)
+await collection.update_one({"user_id": user_id},
+    {"$pull": {"items": {"product_id": item["product_id"]}}})
+
+# 2. Push new item
+await collection.update_one({"user_id": user_id},
+    {"$push": {"items": item}})
+```
+
+This is two operations (not atomic). The simpler alternative uses the positional operator `$` but requires knowing the array index in advance, which means an extra find first.
+
+For a learning project with low concurrency, `$pull` + `$push` is clear and correct. In production with high concurrency, you'd use MongoDB transactions.
+
+### User Identity via HTTP Header (Pre-Auth Pattern)
+
+```python
+def _user_id(x_user_id: str = Header(...)) -> str:
+    return x_user_id.strip()
+```
+
+Using a FastAPI `Header` dependency means the user_id injection point is a single function. When Stage 7 (auth) is built, this function is the only place that changes — all route handlers that use `Depends(_user_id)` automatically get JWT-based identity with zero route changes.
+
+This is called the **Dependency Inversion Principle** applied to authentication: routes depend on an abstract identity interface, not on a concrete "read from header" implementation.
+
+### Interview Questions — Stage 5
+
+1. **Why snapshot the price instead of reading it from the product on every request?** Price stability — the customer saw a specific price and shouldn't have it change in their cart. Also, if a product is deleted, the cart would lose the price reference.
+
+2. **What is the `$pull` operator?** Removes matching elements from an array field. `$pull: {"items": {"product_id": "abc"}}` removes all items from the `items` array where `product_id == "abc"`.
+
+3. **What is the `$push` operator?** Appends an element to an array field. Used with `$addToSet` for unique-set semantics; plain `$push` allows duplicates.
+
+4. **How do you use the positional operator `$` in MongoDB?** In `items.$.quantity`, the `$` refers to the first array element that matched the query filter. For example: `update_one({"items.product_id": "abc"}, {"$set": {"items.$.quantity": 5}})` updates the matching element's quantity.
+
+5. **Why might you prefer MongoDB transactions for cart mutations over the $pull+$push approach?** Transactions guarantee atomicity across multiple operations. Without a transaction, if the server crashes between `$pull` and `$push`, the item is lost from the cart. For cart operations this is usually tolerable; for financial operations (orders), transactions are essential.
+
+---
+
+## Stage 6: Orders — The Full Checkout Flow
+
+### What Was Built
+
+| File | Purpose |
+|------|---------|
+| `app/schemas/order.py` | `OrderStatus` enum, `VALID_TRANSITIONS` state machine, order schemas |
+| `app/repositories/order_repository.py` | Insert, status update, paginated user query |
+| `app/services/order_service.py` | 5-step checkout, ownership enforcement, state machine |
+| `app/api/routes/orders.py` | POST (201), GET list, GET single, PUT status |
+
+**Endpoints:**
+```
+POST /orders/                  → place order from cart (201)
+GET  /orders/                  → list user orders (paginated + status filter)
+GET  /orders/{id}              → get single order (ownership enforced)
+PUT  /orders/{id}/status       → advance status (state machine)
+```
+
+### The 5-Step Checkout Flow
+
+```
+place_order(user_id, shipping_address):
+  1. Fetch cart → validate not empty
+  2. Pre-flight stock check (read-only, all items)
+  3. Deduct inventory for all items ($inc, atomic)
+  4. Create order document (status=pending)
+  5. Clear cart
+```
+
+**Why pre-flight check before deduction?**
+If we deducted item-by-item and item 3 failed the stock check, items 1 and 2 would already be deducted without an order being created. The pre-flight check catches the failure BEFORE any mutations. It's not 100% safe (race condition between check and deduct), but it's the pragmatic approach without transactions.
+
+**Production note — use MongoDB transactions:**
+```python
+async with await client.start_session() as session:
+    async with session.start_transaction():
+        # steps 3+4 together — atomic
+        for item in items:
+            await inv_repo.adjust_stock(item["product_id"], -item["quantity"], session=session)
+        await order_repo.insert_one(order_doc, session=session)
+    # session commits automatically; on error, transaction rolls back
+```
+
+### The Status State Machine
+
+```
+VALID_TRANSITIONS = {
+    "pending":   ["confirmed", "cancelled"],
+    "confirmed": ["shipped",   "cancelled"],
+    "shipped":   ["delivered"],
+    "delivered": [],      ← terminal state
+    "cancelled": [],      ← terminal state
+}
+```
+
+Storing the state machine as a dictionary makes the rules explicit, self-documenting, and testable without mocking. The service checks:
+```python
+allowed = VALID_TRANSITIONS.get(current_status, [])
+if new_status not in allowed:
+    raise InvalidStatusTransitionException(...)
+```
+
+Adding a new status (e.g. `"refunded"`) requires only updating `VALID_TRANSITIONS` — no if/elif chains to modify.
+
+### Ownership Enforcement (Returning 404 vs 403)
+
+```python
+if doc["user_id"] != user_id:
+    raise OrderNotFoundException(...)  # returns 404, not 403
+```
+
+Returning **404** instead of **403** when the order exists but belongs to another user prevents **information disclosure**: a 403 reveals that an order with that ID exists. 404 reveals nothing. This is a security best practice.
+
+### Order List Projection
+
+```python
+projection = {
+    "items": 0,           # omit items array
+    "shipping_address": 0,
+    "notes": 0,
+}
+```
+
+The list endpoint excludes large fields to keep payloads small. Clients call `GET /orders/{id}` to get the full order with items. This is the same lightweight-list / full-detail pattern used in Stage 2 for products.
+
+### Bugs Found and Fixed in Stage 6
+
+| Bug | Fix |
+|-----|-----|
+| `NameError: OrderNotFoundException not defined` in service | Added missing import to `order_service.py` |
+
+### Interview Questions — Stage 6
+
+1. **What is a state machine and how did you implement it?** A state machine restricts which states an entity can move between. Implemented as a dictionary `{current_state: [allowed_next_states]}`. The service looks up the current state, checks if the requested transition is allowed, and raises an error if not.
+
+2. **Why validate stock before deducting (pre-flight check)?** To give a clean error before any mutations occur. If item 3 of 5 fails, items 1 and 2 haven't been deducted yet, so no cleanup is needed.
+
+3. **Why clear the cart AFTER creating the order (not before)?** If order creation fails (database error), the cart should remain intact so the user can retry. Cart clearing is the last step — it only happens on success.
+
+4. **What is the difference between HTTP 403 and 404 for ownership violations?** 403 Forbidden reveals that the resource exists but you don't have access. 404 Not Found reveals nothing about whether the resource exists. For privacy and security, 404 is preferred when you don't want to confirm existence to unauthorized users.
+
+5. **How would you make the checkout flow truly atomic?** Use MongoDB multi-document transactions with a session. Wrap steps 3+4 (inventory deduction + order creation) in `session.start_transaction()`. On any error, the transaction rolls back automatically — no partial state is left in the database.
+
+6. **Why store items in the order document instead of referencing products?** The order is a historical record. Product prices, names, and details can change. The order must always show exactly what was purchased at exactly the price paid, regardless of future catalog changes. This is the same snapshot principle used in the cart.
+
+---
+
+## Summary: Test Coverage After Stages 3–6
+
+| Stage | Unit Tests | Integration Tests | Total Added |
+|-------|-----------|-------------------|-------------|
+| 3 — Search | 0 | 13 | 13 |
+| 4 — Inventory | 0 | 21 | 21 |
+| 5 — Cart | 0 | 21 | 21 |
+| 6 — Orders | 25 | 29 | 54 |
+| **All stages** | **65 unit** | **181 integration** | **246 total** |
+
+---
+
+## Architecture Overview (Post Stage 6)
+
+```
+Client Request
+     │
+     ▼
+FastAPI Router (HTTP boundary — thin handlers only)
+     │  Parses/validates via Pydantic, injects dependencies
+     ▼
+Service Layer (business logic)
+     │  Orchestrates multiple repository calls
+     │  Enforces business rules and state machines
+     ▼
+Repository Layer (data access)
+     │  Single MongoDB collection per repository
+     │  Atomic operations ($inc, $set, find_one_and_update)
+     │  Wraps PyMongoError in domain exceptions
+     ▼
+MongoDB (fashion_commerce / fashion_commerce_test)
+     Collections: products, inventory, carts, orders
+```
+
+**Collections and their indexes:**
+
+| Collection | Key Indexes |
+|-----------|-------------|
+| products | sku (unique), text (name+brand+description), category+price compound, status, final_price |
+| inventory | product_id (unique), quantity |
+| carts | user_id (unique) |
+| orders | user_id+created_at compound, status |
+
+---
