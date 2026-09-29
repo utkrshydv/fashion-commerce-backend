@@ -1,0 +1,51 @@
+services:
+
+  # ── MongoDB ────────────────────────────────────────────────────────────────
+  mongo:
+    image: mongo:7.0
+    container_name: fashion_mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"          # Expose to host for direct access during development
+    volumes:
+      - mongo_data:/data/db    # Named volume for persistent storage
+    environment:
+      MONGO_INITDB_DATABASE: fashion_commerce
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── API ────────────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fashion_api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env.example           # Override with a real .env file in production
+    environment:
+      # Override the default localhost URI to reach the mongo service by name
+      MONGODB_URI: mongodb://mongo:27017
+      MONGODB_DATABASE: fashion_commerce
+      APP_ENV: development
+      LOG_LEVEL: INFO
+    depends_on:
+      mongo:
+        condition: service_healthy   # Wait until Mongo passes its healthcheck
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  mongo_data:
+    driver: local
