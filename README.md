@@ -1,4 +1,4 @@
-﻿# Fashion Commerce Platform Backend
+# Fashion Commerce Platform Backend
 
 A production-style RESTful backend for a fashion e-commerce platform, built as a portfolio project demonstrating clean Python backend architecture.
 
@@ -116,17 +116,17 @@ scripts/
 
 | Stage | Description | Status |
 |-------|-------------|--------|
-| 0 | Architecture & scaffolding | âœ… Complete |
-| 1 | FastAPI foundation + DB connection + health | âœ… Complete |
-| 2 | Product catalog CRUD | âœ… Complete |
-| 3 | Search + filtering + indexes | â¬œ Pending |
-| 4 | Inventory management | â¬œ Pending |
-| 5 | Shopping cart | â¬œ Pending |
-| 6 | Orders | â¬œ Pending |
-| 7 | Background processing | â¬œ Pending |
-| 8 | Testing | â¬œ Pending |
-| 9 | Docker + seed data | â¬œ Pending |
-| 10 | End-to-end verification | â¬œ Pending |
+| 0 | Architecture & scaffolding | Complete |
+| 1 | FastAPI foundation + DB connection + health | Complete |
+| 2 | Product catalog CRUD | Complete |
+| 3 | Search + filtering + indexes | Complete |
+| 4 | Inventory management | Complete |
+| 5 | Shopping cart | Complete |
+| 6 | Orders | Complete |
+| 7 | Background processing (APScheduler / Celery) | Pending |
+| 8 | Hardened test suite (coverage, edge cases) | Pending |
+| 9 | Docker + seed data | Pending |
+| 10 | End-to-end verification + README polish | Pending |
 
 ## Learning Document
 
