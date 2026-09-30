@@ -1665,3 +1665,264 @@ MongoDB (fashion_commerce / fashion_commerce_test)
 | orders | user_id+created_at compound, status |
 
 ---
+
+---
+
+## Stage 7: Background Processing with APScheduler
+
+### What Was Built
+
+| File | Purpose |
+|------|---------|
+| `app/utils/jobs.py` | Pure async job functions — testable independently of the scheduler |
+| `app/core/scheduler.py` | APScheduler setup and job registration |
+| `app/main.py` (lifespan update) | Start scheduler on startup, graceful shutdown |
+
+**Jobs registered:**
+
+| Job | Trigger | What it does |
+|-----|---------|-------------|
+| `low_stock_alert_job` | Every 60 min | Scans inventory, logs products at or below threshold |
+| `auto_cancel_orders_job` | Every 30 min | Bulk-cancels pending orders older than 24h |
+
+### Why APScheduler (not Celery)?
+
+| Feature | APScheduler | Celery |
+|---------|-----------|--------|
+| External broker | Not needed | Redis or RabbitMQ required |
+| Complexity | Low — runs in-process | High — separate worker process |
+| Best for | Single-instance services, cron-style tasks | High-throughput distributed task queues |
+| Portfolio value | Demonstrates scheduling concepts cleanly | Overkill for a learning project |
+
+For a production service with thousands of concurrent tasks or multiple API instances, Celery + Redis would be preferred.
+
+### Key APScheduler Settings
+
+```python
+scheduler = AsyncIOScheduler(
+    job_defaults={
+        "coalesce": True,          # if job was missed multiple times, run ONCE
+        "max_instances": 1,        # never run the same job twice simultaneously
+        "misfire_grace_time": 60,  # tolerate up to 60s late before skipping
+    }
+)
+```
+
+**`coalesce=True`**: If the server is restarted and a job was due 5 times during downtime, it fires only once. Without this, you'd get 5 rapid backfill runs.
+
+**`max_instances=1`**: Prevents a job from starting a second instance if the first one is still running (e.g., DB query takes > 60 minutes).
+
+### Job Design Pattern: Pure Functions
+
+```python
+# GOOD: pure async function, receives db as parameter
+async def low_stock_alert_job(db: AsyncDatabase, threshold: int) -> List[dict]:
+    ...
+
+# BAD: function coupled to scheduler internals
+def job_wrapper():
+    db = get_db_from_global_state()  # untestable, fragile
+    ...
+```
+
+Pure functions:
+- Can be called directly in tests without starting a scheduler
+- Have explicit inputs and outputs — easy to reason about
+- Can be run manually from a script or admin endpoint
+
+### Interview Questions — Stage 7
+
+1. **What is a scheduled job and how does APScheduler work?** APScheduler manages a list of jobs, each with a trigger (cron, interval, date). The `AsyncIOScheduler` integrates with Python's asyncio event loop, running jobs as coroutines without spawning threads.
+
+2. **What is `coalesce` in APScheduler?** When `coalesce=True`, if a job misses its scheduled time (server was down), it fires only once when the server comes back, not once per missed interval. Prevents backfill storms.
+
+3. **What is `max_instances=1`?** Prevents the scheduler from launching a second run of the same job if the previous one hasn't finished. Critical for jobs that query or write to a database — avoids race conditions.
+
+4. **How would you scale background jobs across multiple instances?** APScheduler's MemoryJobStore doesn't coordinate between processes. For multi-instance scheduling: use `APScheduler` with `MongoDBJobStore` (jobs stored in Mongo, coordination via locks), or switch to Celery Beat with Redis as the broker.
+
+5. **Why is `auto_cancel_orders_job` idempotent?** It uses `update_many` with a filter `status=pending AND created_at < cutoff`. Running it twice produces the same result — already-cancelled orders don't match `status=pending`, so they're not touched again.
+
+---
+
+## Stage 8: Hardened Test Suite + Coverage
+
+### What Was Built
+
+| Tool | Purpose |
+|------|---------|
+| `pytest-cov` | Measures which lines/branches are executed during tests |
+| `pyproject.toml [tool.coverage]` | Configuration: `branch=true`, `fail_under=70`, `show_missing=true` |
+| `tests/integration/test_edge_cases.py` | 28 scenario tests covering gaps in the existing suite |
+
+**Coverage achieved: 89.51%** (296 tests)
+
+### Branch Coverage vs Line Coverage
+
+```python
+# Line coverage: was this line reached?
+if status == "active":           # line executed → covered
+    do_something()               # line executed → covered
+
+# Branch coverage: was EVERY branch taken?
+if status == "active":           # branch True taken → covered
+    do_something()
+# branch False (status != "active") never reached → NOT covered
+```
+
+`branch=True` catches **silent gaps** — code paths that exist but are never tested.
+
+### Coverage Configuration in pyproject.toml
+
+```toml
+[tool.coverage.run]
+source = ["app"]        # only measure coverage of our app code
+branch = true           # track both True/False branches
+omit = ["app/models/*"] # exclude scaffold/placeholder files
+
+[tool.coverage.report]
+fail_under = 70         # CI fails if coverage drops below 70%
+show_missing = true     # print line numbers not covered
+```
+
+**Run with coverage:**
+```bash
+pytest --cov=app --cov-report=term-missing
+```
+
+### Bugs Found During Stage 8
+
+| Bug | Root Cause | Fix |
+|-----|-----------|-----|
+| `clear_cart` on non-existent cart returned `None` → Pydantic crash | `find_one_and_update` without `upsert=True` returns `None` if no document matches | Added `upsert=True` + `$setOnInsert` so it creates an empty cart atomically |
+
+**Lesson**: Edge case tests are valuable precisely because they test paths the happy-path tests don't reach. The "clear an already-empty cart" test found a real bug.
+
+### Interview Questions — Stage 8
+
+1. **What is the difference between line and branch coverage?** Line coverage checks if a line was executed. Branch coverage checks if every possible branch (if/else True AND False, loop entered AND skipped) was exercised. Branch coverage finds more bugs.
+
+2. **What is `fail_under` in pytest-cov?** A minimum coverage percentage threshold. If total coverage drops below this value, pytest exits with a non-zero code — useful in CI to enforce coverage requirements.
+
+3. **What makes a good unit test vs a good integration test?** Unit tests: fast, no I/O, test a single function in isolation, use mocks for dependencies. Integration tests: test multiple layers together (router → service → repository → DB), catch interface mismatches that unit tests miss.
+
+4. **How do you test background jobs without starting the scheduler?** Call the job function directly with a test database handle. The job functions are pure async functions, so they can be awaited in any async test without needing the scheduler infrastructure.
+
+---
+
+## Stage 9: Docker + Seed Data
+
+### What Was Built
+
+| File | Purpose |
+|------|---------|
+| `Dockerfile` | Multi-stage build (builder + runtime), non-root user |
+| `docker-compose.yml` | MongoDB 7 + API with health checks and dependency ordering |
+| `scripts/seed_database.py` | 26 products, inventory, 6 orders across 3 users |
+
+### Multi-Stage Dockerfile Explained
+
+```dockerfile
+# Stage 1: builder — has pip, build tools
+FROM python:3.12-slim AS builder
+RUN python -m venv /build/.venv
+RUN /build/.venv/bin/pip install -r requirements.txt
+
+# Stage 2: runtime — no pip, no build tools
+FROM python:3.12-slim AS runtime
+COPY --from=builder /build/.venv /app/.venv  # copy only the venv
+COPY . .
+USER appuser  # non-root
+CMD ["uvicorn", ...]
+```
+
+**Why multi-stage?**
+- The builder has pip + setuptools which are not needed at runtime.
+- Final image is ~50% smaller and has a smaller attack surface.
+- A compromised container cannot install new packages (no pip).
+
+### Docker Compose Dependency Ordering
+
+```yaml
+api:
+  depends_on:
+    mongo:
+      condition: service_healthy   # waits for healthcheck to pass
+```
+
+Without `condition: service_healthy`, Docker would start the API container as soon as the MongoDB *container* starts — but MongoDB hasn't finished initializing yet. The API would fail to connect.
+
+`service_healthy` means Docker polls MongoDB's healthcheck command (`mongosh --eval "db.adminCommand('ping')"`) and only starts the API after it succeeds.
+
+### Docker Internal DNS
+
+```yaml
+environment:
+  MONGODB_URI: mongodb://mongo:27017  # "mongo" is the service name
+```
+
+Docker Compose creates an internal DNS where each service is reachable by its **service name**. The API doesn't know the MongoDB container's IP — it just uses `mongo` as the hostname. This works because both services are on the same Docker network (automatically created by Compose).
+
+### Seed Data Design
+
+```
+26 products:
+  Men         → 8  (shirts, jeans, suits, jackets...)
+  Women       → 8  (dresses, tops, blazers, kurtas...)
+  Kids        → 4  (t-shirts, jeans, party dress, hoodie)
+  Accessories → 6  (bag, watch, belt, scarf, cap, sunglasses)
+  Inactive    → 1  (tests status filtering)
+
+3 intentionally low-stock products:
+  MEN-POLO-001, WOM-KURTA-001, ACC-SCARF-001
+  (stock ≤ 10 → will trigger the low_stock_alert_job)
+
+6 sample orders (3 users × 2 orders each):
+  Status spread: pending, confirmed, shipped, delivered, cancelled
+```
+
+**Idempotency**: Products are upserted by SKU. Orders are only inserted if the collection is empty. Running the script twice produces the same database state.
+
+### Interview Questions — Stage 9
+
+1. **What is a multi-stage Docker build?** A Dockerfile with multiple `FROM` statements. Each stage can build on the previous one. The final stage only includes what it needs — build tools from earlier stages are discarded. Result: smaller, more secure images.
+
+2. **Why run containers as a non-root user?** If a process inside the container is compromised, it should have minimal permissions. A root user inside a container can potentially escape to the host or access host files via volume mounts. A UID 1001 user can only access what it owns.
+
+3. **What is `depends_on` with `condition: service_healthy`?** It tells Docker Compose to wait for a service's health check to pass before starting the dependent service. The health check is a command (e.g., `mongosh --eval "ping"`) that Docker runs periodically until it succeeds.
+
+4. **What is Docker internal DNS?** Docker Compose creates a virtual network where each service is addressable by its service name. `mongodb://mongo:27017` works because Docker resolves `mongo` to the MongoDB container's IP on the internal network.
+
+5. **What is seed data and why is it useful?** Seed data is a script that populates a development database with realistic test records. It makes the app immediately usable for manual testing (Postman, Swagger UI), demos, and showcasing the project — without needing to create data by hand.
+
+---
+
+## Final Architecture Summary (Stages 0-9)
+
+```
+fashioncommerce-backend/
+├── app/
+│   ├── main.py                   # App factory, lifespan, exception handler
+│   ├── api/routes/               # Thin HTTP handlers (6 routers)
+│   │   ├── health.py             # GET /health
+│   │   ├── products.py           # CRUD /products
+│   │   ├── search.py             # GET /search
+│   │   ├── inventory.py          # /inventory
+│   │   ├── cart.py               # /cart
+│   │   └── orders.py             # /orders
+│   ├── services/                 # Business logic (validates, orchestrates)
+│   ├── repositories/             # MongoDB queries only
+│   ├── schemas/                  # Pydantic request/response models
+│   ├── db/                       # Connection + index management
+│   ├── core/                     # Config, exceptions, logging, scheduler
+│   └── utils/jobs.py             # Background job functions
+│
+├── tests/
+│   ├── unit/                     # 87 unit tests
+│   └── integration/              # 209 integration tests
+│
+├── scripts/seed_database.py      # 26 products, inventory, 6 orders
+├── Dockerfile                    # Multi-stage, non-root
+└── docker-compose.yml            # MongoDB + API, health-checked
+```
+
+**296 tests | 89.51% coverage | 13 endpoints | 4 collections | 2 background jobs**

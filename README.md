@@ -124,7 +124,7 @@ scripts/
 | 6 | Orders | Complete |
 | 7 | Background processing (APScheduler / Celery) | Complete |
 | 8 | Hardened test suite (coverage, edge cases) | Complete |
-| 9 | Docker + seed data | Pending |
+| 9 | Docker + seed data | Complete |
 | 10 | End-to-end verification + README polish | Pending |
 
 ## Learning Document

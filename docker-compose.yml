@@ -1,14 +1,28 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# docker-compose.yml — Production-style service definitions
+#
+# Usage:
+#   docker compose up --build          → start everything (first time)
+#   docker compose up -d               → start in background
+#   docker compose logs -f api         → follow API logs
+#   docker compose down                → stop containers
+#   docker compose down -v             → stop + delete volumes (wipe data)
+#
+# Seed data (after services are running):
+#   docker compose exec api python scripts/seed_database.py
+# ─────────────────────────────────────────────────────────────────────────────
+
 services:
 
-  # ── MongoDB ────────────────────────────────────────────────────────────────
+  # ── MongoDB ───────────────────────────────────────────────────────────────
   mongo:
     image: mongo:7.0
     container_name: fashion_mongo
     restart: unless-stopped
     ports:
-      - "27017:27017"          # Expose to host for direct access during development
+      - "27017:27017"       # Exposed to host for local dev tools (Compass, mongosh)
     volumes:
-      - mongo_data:/data/db    # Named volume for persistent storage
+      - mongo_data:/data/db # Persistent storage — survives container restarts
     environment:
       MONGO_INITDB_DATABASE: fashion_commerce
     healthcheck:
@@ -18,26 +32,26 @@ services:
       retries: 5
       start_period: 20s
 
-  # ── API ────────────────────────────────────────────────────────────────────
+  # ── API ───────────────────────────────────────────────────────────────────
   api:
     build:
       context: .
       dockerfile: Dockerfile
+      target: runtime          # Use the lean runtime stage, not the builder
+    image: fashion-commerce-api:latest
     container_name: fashion_api
     restart: unless-stopped
     ports:
       - "8000:8000"
-    env_file:
-      - .env.example           # Override with a real .env file in production
     environment:
-      # Override the default localhost URI to reach the mongo service by name
+      # MongoDB URI uses the service name 'mongo' — Docker's internal DNS
       MONGODB_URI: mongodb://mongo:27017
       MONGODB_DATABASE: fashion_commerce
       APP_ENV: development
       LOG_LEVEL: INFO
     depends_on:
       mongo:
-        condition: service_healthy   # Wait until Mongo passes its healthcheck
+        condition: service_healthy   # Don't start until MongoDB is accepting connections
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
@@ -46,6 +60,7 @@ services:
       retries: 3
       start_period: 40s
 
+# ── Volumes ───────────────────────────────────────────────────────────────────
 volumes:
   mongo_data:
     driver: local
