@@ -1,8 +1,12 @@
 # Fashion Commerce Platform Backend
 
-A production-style RESTful backend for a fashion e-commerce platform.
-Built as a portfolio project demonstrating clean Python backend architecture,
-async MongoDB integration, background processing, and a comprehensive test suite.
+A backend API for a fashion e-commerce platform. It handles everything a typical
+online clothing store needs on the server side: managing a product catalog,
+letting users search and filter items, maintaining a shopping cart, placing orders,
+and tracking stock levels. Two background jobs run automatically to monitor
+low-stock products and cancel stale unpaid orders.
+
+Built with FastAPI and MongoDB. Runs locally or in Docker with one command.
 
 296 tests | 89% coverage | 13 endpoints | 4 collections | 2 background jobs
 
