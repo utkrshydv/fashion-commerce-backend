@@ -73,6 +73,8 @@ class CartService:
             )
 
         unit_price = product.get("final_price", product["price"])
+        images = product.get("image_urls", [])
+        image_url = images[0] if images else None
         item_doc = {
             "product_id": data.product_id,
             "sku": product["sku"],
@@ -80,6 +82,7 @@ class CartService:
             "quantity": data.quantity,
             "unit_price": unit_price,
             "subtotal": round(unit_price * data.quantity, 2),
+            "image_url": image_url,
         }
 
         doc = await self._cart.upsert_item(user_id, item_doc)

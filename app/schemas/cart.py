@@ -32,6 +32,7 @@ class CartItem(BaseModel):
     quantity: int = Field(ge=1)
     unit_price: float = Field(description="Price at time of adding to cart (snapshot)")
     subtotal: float = Field(description="unit_price * quantity, computed")
+    image_url: Optional[str] = Field(default=None, description="Primary product image URL")
 
 
 class CartItemAdd(BaseModel):
