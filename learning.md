@@ -1926,3 +1926,88 @@ fashioncommerce-backend/
 ```
 
 **296 tests | 89.51% coverage | 13 endpoints | 4 collections | 2 background jobs**
+
+---
+
+## Stage 10: End-to-End Verification + Final Polish
+
+### What Was Done
+
+| Task | Output |
+|------|--------|
+| Live smoke test | App starts, scheduler registers 2 jobs, `/health` returns `{"status":"ok"}` |
+| Full test suite run | 296 passed, 0 failed |
+| README complete rewrite | ASCII-only, accurate endpoint table, all 10 stages marked complete |
+| TESTING.md created | 7 sections: automated, Swagger, curl, E2E scenario, seeded users, error cases, Docker |
+
+### Smoke Test Results
+
+On startup, the app logs:
+```
+Starting Fashion Commerce Backend v0.1.0 [env=development]
+MongoDB connected -- database: fashion_commerce
+Product indexes ensured.
+Order indexes ensured.
+Cart indexes ensured.
+Inventory indexes ensured.
+Registered job: low_stock_alert (interval=60min, threshold=10)
+Registered job: auto_cancel_orders (interval=30min, expiry=24h)
+Background scheduler started (2 jobs registered).
+Application startup complete -- ready to serve requests.
+```
+
+`GET /health` returns: `{"status":"ok","version":"0.1.0","environment":"development","database":"ok"}`
+
+### Final Metrics
+
+| Metric | Value |
+|--------|-------|
+| Total tests | 296 |
+| Unit tests | 87 |
+| Integration tests | 209 |
+| Coverage | 89.51% |
+| Endpoints | 13 routes across 6 routers |
+| Collections | products, inventory, carts, orders |
+| Indexes | 13 indexes across 4 collections |
+| Background jobs | 2 (low_stock_alert, auto_cancel_orders) |
+| Seed data | 26 products, 6 orders, 3 users |
+| Docker images | multi-stage build (builder + runtime) |
+
+### What Good E2E Verification Tests
+
+1. **App boots without errors** -- all imports resolve, DB connects, indexes create, scheduler starts.
+2. **Health endpoint returns 200** -- DB ping succeeds, version matches config.
+3. **Complete user journey works** -- product created, added to cart, ordered, inventory deducted, cart cleared, status advanced to delivered.
+4. **Error paths return correct codes** -- 404 for not found, 409 for duplicates, 422 for business violations, 400 for state machine violations.
+5. **Security properties hold** -- user isolation (User B cannot see User A orders), inactive products blocked from cart.
+
+### Interview Questions -- Stage 10
+
+1. **How do you verify a service is production-ready?** Automated tests (unit + integration + coverage), a smoke test that runs the full startup sequence, manual E2E test of the critical user journey, and monitoring/alerting setup (health endpoint, structured logs, background job status).
+
+2. **What is the difference between a smoke test and an integration test?** Integration tests are automated and test specific code paths in isolation. A smoke test is a quick sanity check that the running service responds correctly to basic requests -- it tests the whole system end-to-end, including infrastructure (network, database connections).
+
+3. **What would you add next to make this production-ready?** JWT authentication (Stage 7 was a placeholder), rate limiting (slowapi), request ID tracing (middleware), MongoDB Atlas for managed hosting, CI/CD pipeline (GitHub Actions running pytest on every push), and proper secrets management (HashiCorp Vault or AWS Secrets Manager).
+
+4. **How do you document an API for other developers?** FastAPI auto-generates OpenAPI (Swagger UI at /docs, ReDoc at /redoc). Supplement with a TESTING.md showing real curl examples, a README with quick start, and a learning.md explaining design decisions for maintainers.
+
+---
+
+## Complete Project Summary
+
+This project demonstrates a production-style Python backend from scratch to deployment-ready:
+
+| Concept | Where demonstrated |
+|---------|-------------------|
+| Layered architecture | Router -> Service -> Repository -> MongoDB |
+| Async Python | asyncio, PyMongo Async, APScheduler AsyncIO |
+| Pydantic v2 | Request validation, response serialization, Settings |
+| MongoDB patterns | $text index, $inc atomic update, $pull+$push, upsert, aggregation |
+| State machines | Order status VALID_TRANSITIONS dict |
+| Price snapshotting | Cart items store unit_price at add-time |
+| Ownership enforcement | 404 not 403 for privacy |
+| Background jobs | APScheduler, coalesce, max_instances, pure functions |
+| Test architecture | conftest fixtures, autouse cleanup, function-scoped event loop |
+| Coverage | Branch coverage, fail_under, show_missing |
+| Containerisation | Multi-stage Dockerfile, non-root user, service_healthy depends_on |
+| Idempotent operations | Seed script, index creation, clear_cart, job functions |
