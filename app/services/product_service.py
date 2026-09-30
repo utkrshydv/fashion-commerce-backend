@@ -177,8 +177,8 @@ class ProductService:
 
         skip = (page - 1) * limit
 
-        # Projection: exclude large fields for list responses
-        projection = {"description": 0, "image_urls": 0}
+        # Projection: exclude description for list responses
+        projection = {"description": 0}
 
         docs, total = await self._repo.find_many(
             filters=filters,

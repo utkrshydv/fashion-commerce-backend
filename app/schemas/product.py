@@ -199,6 +199,7 @@ class ProductListItem(BaseModel):
     stock_quantity: int
     status: ProductStatus
     created_at: datetime
+    image_urls: List[str] = Field(default_factory=list)
 
     model_config = {
         "populate_by_name": True,
